@@ -1,138 +1,108 @@
-"""Topology and graph-aware incident analysis."""
+"""Dependency graph, blast radius, and anomaly reasoning."""
 
 from __future__ import annotations
 
-from collections import deque
+from statistics import mean, pstdev
 
-import networkx as nx
-
-from core.mock import get_service, list_service_names
-
-
-def build_graph() -> nx.DiGraph:
-    graph = nx.DiGraph()
-    for service_name in list_service_names():
-        graph.add_node(service_name)
-    for service_name in list_service_names():
-        service = get_service(service_name)
-        if not service:
-            continue
-        for dependency in service["dependencies"]:
-            graph.add_edge(dependency, service_name)
-    return graph
-
-
-GRAPH = build_graph()
+from core.services import DEPENDENCIES, SERVICE_ORDER, USER_WEIGHTS, downstream_services, latency_baseline, latency_samples, observe_latency, service_exists, service_metrics, service_status, upstream_services
 
 
 def refresh_graph() -> None:
-    GRAPH.clear()
-    GRAPH.add_nodes_from(list_service_names())
-    for service_name in list_service_names():
-        service = get_service(service_name)
-        if not service:
-            continue
-        for dependency in service["dependencies"]:
-            GRAPH.add_edge(dependency, service_name)
+    return None
 
 
 def downstream_dependents(service_name: str) -> list[str]:
-    if not GRAPH.has_node(service_name):
-        return []
-    seen = set()
-    queue = deque([service_name])
-    dependents = []
-    while queue:
-        current = queue.popleft()
-        for child in GRAPH.successors(current):
-            if child in seen:
-                continue
-            seen.add(child)
-            dependents.append(child)
-            queue.append(child)
-    return dependents
+    return downstream_services(service_name)
 
 
 def upstream_chain(service_name: str) -> list[str]:
-    if not GRAPH.has_node(service_name):
-        return []
-    seen = set()
-    queue = deque([service_name])
-    chain = []
-    while queue:
-        current = queue.popleft()
-        for parent in GRAPH.predecessors(current):
-            if parent in seen:
-                continue
-            seen.add(parent)
-            chain.append(parent)
-            queue.append(parent)
-    return chain
+    return upstream_services(service_name)
 
 
 def get_dependency_chain(service_name: str) -> dict:
-    service = get_service(service_name)
-    if service is None:
-        return {"error": f"service not found: {service_name}"}
-    return {"service": service_name, "upstream": upstream_chain(service_name), "downstream": downstream_dependents(service_name)}
+    if not service_exists(service_name):
+        return {"ok": False, "error": {"code": "invalid_service", "message": f"invalid service name: {service_name}"}}
+    return {
+        "ok": True,
+        "service": service_name,
+        "upstream": upstream_chain(service_name),
+        "downstream": downstream_dependents(service_name),
+        "direct_dependencies": list(DEPENDENCIES.get(service_name, [])),
+    }
 
 
 def get_service_graph() -> dict:
-    refresh_graph()
-    adjacency = {node: sorted(list(GRAPH.successors(node))) for node in GRAPH.nodes}
-    return {"nodes": sorted(GRAPH.nodes), "adjacency": adjacency, "edges": sorted([list(edge) for edge in GRAPH.edges])}
+    adjacency = {name: list(DEPENDENCIES.get(name, [])) for name in SERVICE_ORDER}
+    reverse_adjacency = {name: downstream_dependents(name) for name in SERVICE_ORDER}
+    return {"ok": True, "nodes": SERVICE_ORDER, "adjacency": adjacency, "reverse_adjacency": reverse_adjacency}
 
 
 def get_blast_radius(service_name: str) -> dict:
-    refresh_graph()
-    if not GRAPH.has_node(service_name):
-        return {"error": f"service not found: {service_name}"}
+    if not service_exists(service_name):
+        return {"ok": False, "error": {"code": "invalid_service", "message": f"invalid service name: {service_name}"}}
     impacted = downstream_dependents(service_name)
-    users = 0
-    for impacted_service in impacted:
-        service = get_service(impacted_service)
-        if service:
-            users += int(service["users"])
-    return {"service": service_name, "impacted_services": impacted, "impacted_service_count": len(impacted), "estimated_users_impacted": users}
+    users = sum(USER_WEIGHTS.get(name, 0) for name in impacted)
+    return {"ok": True, "service": service_name, "impacted_services": impacted, "impacted_service_count": len(impacted), "estimated_users_impacted": users}
 
 
 def detect_anomaly() -> list[dict]:
-    refresh_graph()
-    anomalies = []
-    for service_name in list_service_names():
-        service = get_service(service_name)
-        if not service:
-            continue
+    anomalies: list[dict] = []
+    for service_name in SERVICE_ORDER:
         if not downstream_dependents(service_name):
             continue
-        current = service["current_metrics"]
-        base = service["base_metrics"]
-        std = service["metric_std"]
-        deviations = {}
-        for metric_name in ("cpu", "memory", "latency", "request_rate", "error_rate"):
-            sigma = std[metric_name] or 1.0
-            deviations[metric_name] = abs(current[metric_name] - base[metric_name]) / sigma
-        if any(value > 2.0 for value in deviations.values()):
-            anomalies.append({"service": service_name, "downstream_dependents": downstream_dependents(service_name), "current_metrics": current, "baseline": base, "deviations_sigma": deviations})
+        snapshot = service_metrics(service_name)
+        if not snapshot.get("ok"):
+            continue
+        current_latency = snapshot.get("latency")
+        if current_latency is None:
+            continue
+        baseline = latency_baseline(service_name)
+        samples = latency_samples(service_name)
+        if baseline is None:
+            observe_latency(service_name, current_latency)
+            continue
+        avg = mean(samples) if samples else baseline
+        std_dev = pstdev(samples) if len(samples) >= 3 else 0.0
+        threshold = max(baseline * 1.5, avg + 2 * std_dev)
+        if current_latency > threshold:
+            anomalies.append(
+                {
+                    "service": service_name,
+                    "downstream_dependents": downstream_dependents(service_name),
+                    "current_latency": current_latency,
+                    "baseline_latency": baseline,
+                    "threshold": round(threshold, 2),
+                    "std_dev": round(std_dev, 2),
+                }
+            )
     return anomalies
 
 
 def get_incident_score() -> int:
-    refresh_graph()
     score = 0.0
-    for service_name in list_service_names():
-        service = get_service(service_name)
-        if not service:
+    degraded_services = []
+    for service_name in SERVICE_ORDER:
+        snapshot = service_status(service_name)
+        if snapshot.get("ok") is False:
             continue
-        if service["status"] == "down":
-            score += 28
-        elif service["fault_state"]["degraded"]:
-            score += 14
-        if service["fault_state"]["latency_spike_ms"]:
-            score += min(12, service["fault_state"]["latency_spike_ms"] / 20)
-        if service["fault_state"]["memory_leak"]:
-            score += 8
+        if snapshot.get("status") == "down" or not snapshot.get("reachable"):
+            score += 25
+            degraded_services.append(service_name)
+        elif snapshot.get("status") == "degraded":
+            score += 12
+            degraded_services.append(service_name)
+
+    blast_score = max((get_blast_radius(name).get("impacted_service_count", 0) for name in degraded_services), default=0)
+    score += blast_score * 8
     score += len(detect_anomaly()) * 10
-    if any(get_service(service_name)["status"] == "down" for service_name in list_service_names() if get_service(service_name)):
-        score += 12
+
+    from core.logs import count_errors_in_logs
+
+    error_score = 0.0
+    for service_name in SERVICE_ORDER:
+        error_info = count_errors_in_logs(service_name, 50)
+        if error_info.get("ok"):
+            error_score += min(8.0, error_info.get("error_rate", 0.0) * 40.0)
+
+    score += error_score
     return int(max(0, min(100, round(score))))
