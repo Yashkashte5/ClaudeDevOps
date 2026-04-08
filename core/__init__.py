@@ -1,0 +1,1 @@
+"""ClaudeDevops MCP core package."""
