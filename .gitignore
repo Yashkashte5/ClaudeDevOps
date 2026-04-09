@@ -1,2 +1,12 @@
-__pycache__
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+s3_upload_logs/
+TEST_REPORT_*.md
+verify_s3_deploy.sh
+test_all_tools.py
+test.py
+s3_bootstrap_check.py
+live_tool_validation.py
 .env

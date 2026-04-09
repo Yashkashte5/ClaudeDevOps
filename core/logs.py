@@ -1,14 +1,13 @@
-"""SSH-backed log retrieval and error counting."""
+"""SSM-backed log retrieval and error counting."""
 
 from __future__ import annotations
 
 import json
 import os
-import shlex
 from collections import OrderedDict
 from typing import Any
 
-from core.services import error_response, list_service_names, run_ssh, service_exists
+from core.services import error_response, list_service_names, run_ssm_command, service_exists
 
 
 DEFAULT_LOG_CANDIDATES = OrderedDict(
@@ -50,32 +49,28 @@ def read_logs(service_name: str, line_count: int) -> dict[str, Any]:
     if not service_exists(service_name):
         return error_response(f"invalid service name: {service_name}", service_name=service_name, code="invalid_service")
 
-    safe_line_count = max(1, int(line_count))
-    quoted_candidates = " ".join(shlex.quote(candidate) for candidate in candidate_log_files(service_name))
-    remote_command = (
-        "for f in "
-        + quoted_candidates
-        + "; do "
-        + "if [ -f \"$f\" ]; then "
-        + "echo __LOG_FILE__:$f; "
-        + f"tail -n {safe_line_count} \"$f\"; "
-        + "exit 0; "
-        + "fi; "
-        + "done; "
-        + "exit 3"
-    )
-    result = run_ssh(f"bash -lc {shlex.quote(remote_command)}")
-    if result.get("ok") and result.get("stdout"):
-        lines = result["stdout"].splitlines()
-        if lines and lines[0].startswith("__LOG_FILE__:"):
-            selected_file = lines[0].split(":", 1)[1]
-            payload_lines = lines[1:]
+    for candidate in candidate_log_files(service_name):
+        commands = [
+            f"if [ -f '{candidate}' ]; then tail -n 50 '{candidate}'; else echo __LOG_MISSING__; fi"
+        ]
+        result = run_ssm_command(commands)
+        if result.get("status") == "success":
+            stdout = (result.get("stdout") or "").strip()
+            if stdout and stdout != "__LOG_MISSING__":
+                payload_lines = stdout.splitlines()
+                return {
+                    "ok": True,
+                    "service": service_name,
+                    "log_file": candidate,
+                    "line_count": len(payload_lines),
+                    "lines": payload_lines,
+                }
+        else:
             return {
-                "ok": True,
                 "service": service_name,
-                "log_file": selected_file,
-                "line_count": len(payload_lines),
-                "lines": payload_lines,
+                "status": "failed",
+                "stdout": result.get("stdout", ""),
+                "stderr": result.get("stderr", ""),
             }
 
     return error_response(

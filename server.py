@@ -9,6 +9,7 @@ from core.chaos import kill_service as chaos_kill_service
 from core.chaos import restart_service as chaos_restart_service
 from core.graph import get_dependency_chain as graph_get_dependency_chain
 from core.logs import read_logs
+from core.s3 import list_s3_objects as s3_list_objects
 from core.services import error_response, list_service_names, service_health, service_metrics, service_status, service_url
 
 
@@ -70,7 +71,7 @@ def get_metrics(service_name: str) -> dict:
 
 @mcp.tool()
 def get_logs(service_name: str, line_count: int = 10) -> dict:
-    """Fetch logs from EC2 via SSH."""
+    """Fetch logs from EC2 via SSM."""
 
     guard = _guard(service_name)
     if guard:
@@ -83,7 +84,7 @@ def get_logs(service_name: str, line_count: int = 10) -> dict:
 
 @mcp.tool()
 def restart_service(service_name: str) -> dict:
-    """Restart the service via SSH."""
+    """Restart the service via SSM."""
 
     guard = _guard(service_name)
     if guard:
@@ -108,10 +109,20 @@ def kill_service(service_name: str) -> dict:
     guard = _guard(service_name)
     if guard:
         return guard
-    result = chaos_kill_service(service_name, triggered_by="kill_service")
-    if "error" in result:
-        return result
-    return {"status": result.get("status")}
+    return chaos_kill_service(service_name, triggered_by="kill_service")
+
+
+@mcp.tool()
+def list_s3_logs(prefix: str = "") -> dict:
+    """List historical service logs from S3 bucket (claudedevops-logs).
+    
+    Args:
+        prefix: Optional prefix to filter by service (e.g., 'api-gateway/')
+    
+    Returns:
+        {"files": [{"key": "...", "last_modified": "..."}]} sorted by latest first
+    """
+    return s3_list_objects(prefix)
 
 
 if __name__ == "__main__":

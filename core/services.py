@@ -1,10 +1,9 @@
-"""Live EC2 service registry, HTTP probing, SSH execution, and local fault state."""
+"""Live EC2 service registry, HTTP probing, SSM execution, and local fault state."""
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
 import threading
 import time
 from collections import deque
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import boto3
 
 
 def _load_env_file() -> None:
@@ -35,14 +35,22 @@ def _load_env_file() -> None:
 
 _load_env_file()
 
-SSH_HOST = os.getenv("CLAUDEDEVOPS_SSH_HOST", "43.205.127.108")
-PUBLIC_IP = SSH_HOST  # Use SSH_HOST as the public IP for HTTP probing
+SERVICE_HOST = os.getenv("CLAUDEDEVOPS_SERVICE_HOST", "43.205.127.108")
+PUBLIC_IP = SERVICE_HOST
+INSTANCE_ID = os.getenv("CLAUDEDEVOPS_INSTANCE_ID", "<your-ec2-instance-id>")
+AWS_REGION = os.getenv("CLAUDEDEVOPS_AWS_REGION", "ap-south-1")
+ssm = boto3.client("ssm", region_name=AWS_REGION)
+
+SERVICE_PORTS = {
+    "api-gateway": 8001,
+    "auth-service": 8002,
+    "user-service": 8003,
+    "payment-service": 8004,
+    "notification-service": 8005,
+}
+
 SERVICES = {
-    "api-gateway": f"http://{SSH_HOST}:8001",
-    "auth-service": f"http://{SSH_HOST}:8002",
-    "user-service": f"http://{SSH_HOST}:8003",
-    "payment-service": f"http://{SSH_HOST}:8004",
-    "notification-service": f"http://{SSH_HOST}:8005",
+    name: f"http://{SERVICE_HOST}:{port}" for name, port in SERVICE_PORTS.items()
 }
 
 DEPENDENCIES = {
@@ -88,11 +96,7 @@ DEFAULT_MEMORY_BASELINES = {
     "notification-service": 39.0,
 }
 
-SSH_USER = os.getenv("CLAUDEDEVOPS_SSH_USER", "ubuntu")
-SSH_KEY_PATH = os.getenv("CLAUDEDEVOPS_SSH_KEY_PATH") or os.getenv("SSH_KEY_PATH")
-SSH_PORT = int(os.getenv("CLAUDEDEVOPS_SSH_PORT", "22"))
-SSH_CONNECT_TIMEOUT = int(os.getenv("CLAUDEDEVOPS_SSH_CONNECT_TIMEOUT", "8"))
-SSH_COMMAND_TIMEOUT = int(os.getenv("CLAUDEDEVOPS_SSH_COMMAND_TIMEOUT", "45"))
+SSM_COMMAND_TIMEOUT = int(os.getenv("CLAUDEDEVOPS_SSM_COMMAND_TIMEOUT", "45"))
 HTTP_TIMEOUT = float(os.getenv("CLAUDEDEVOPS_HTTP_TIMEOUT", "5"))
 
 _SESSION = requests.Session()
@@ -140,7 +144,7 @@ def service_url(service_name: str) -> str:
 
 
 def service_port(service_name: str) -> int:
-    return int(service_url(service_name).rsplit(":", 1)[-1])
+    return int(SERVICE_PORTS[service_name])
 
 
 def service_metadata(service_name: str) -> dict[str, Any]:
@@ -367,18 +371,32 @@ def service_health(service_name: str) -> dict[str, Any]:
 
 
 def service_status(service_name: str) -> dict[str, Any]:
-    snapshot = probe_service(service_name)
-    if snapshot.get("ok") is False and "error" in snapshot:
-        return snapshot
+    if not service_exists(service_name):
+        return error_response(f"invalid service name: {service_name}", service_name=service_name, code="invalid_service")
+
+    port = service_port(service_name)
+    result = run_ssm_command(["ps aux | grep uvicorn || true"])
+    if result.get("status") != "success":
+        return {
+            "service": service_name,
+            "status": "failed",
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+        }
+
+    target = f"--port {port}"
+    lines = (result.get("stdout") or "").splitlines()
+    reachable = any("uvicorn" in line and target in line for line in lines)
+
     return {
         "ok": True,
         "service": service_name,
         "base_url": service_url(service_name),
-        "reachable": bool(snapshot.get("reachable")),
-        "status": "down" if not snapshot.get("reachable") else snapshot.get("status", "healthy"),
-        "latency": snapshot.get("latency"),
-        "uptime": snapshot.get("uptime"),
-        "http_status": snapshot.get("http_status"),
+        "reachable": reachable,
+        "status": "healthy" if reachable else "down",
+        "latency": None,
+        "uptime": None,
+        "http_status": None,
         "version": STATE[service_name]["version"],
         "replica_count": STATE[service_name]["replica_count"],
     }
@@ -414,54 +432,59 @@ def error_response(message: str, *, service_name: str | None = None, code: str =
     return payload
 
 
-def _load_ssh_key() -> str:
-    if not SSH_KEY_PATH:
-        raise FileNotFoundError("CLAUDEDEVOPS_SSH_KEY_PATH or SSH_KEY_PATH is not set")
-    if not os.path.exists(SSH_KEY_PATH):
-        raise FileNotFoundError(f"SSH key not found: {SSH_KEY_PATH}")
-    return SSH_KEY_PATH
+def run_ssm_command(commands: list[str]) -> dict[str, Any]:
+    """Execute commands via SSM and wait for terminal status with retries."""
 
+    if INSTANCE_ID == "<your-ec2-instance-id>":
+        return {"status": "failed", "stdout": "", "stderr": "CLAUDEDEVOPS_INSTANCE_ID is not set"}
 
-def run_ssh(command: str) -> dict[str, Any]:
-    try:
-        key_path = _load_ssh_key()
-    except Exception as exc:
-        return error_response(str(exc), code="ssh_config_error")
+    max_retries = 3
+    timeout_seconds = 15
+    poll_interval = 0.5
 
-    ssh_args = [
-        "ssh",
-        "-i",
-        key_path,
-        "-p",
-        str(SSH_PORT),
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
-        f"{SSH_USER}@{SSH_HOST}",
-        command,
-    ]
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = ssm.send_command(
+                InstanceIds=[INSTANCE_ID],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": commands},
+                TimeoutSeconds=SSM_COMMAND_TIMEOUT,
+            )
+            command_id = response["Command"]["CommandId"]
+            print(f"[ssm] command_id={command_id} attempt={attempt}")
 
-    try:
-        result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=SSH_COMMAND_TIMEOUT, check=False)
-    except FileNotFoundError:
-        return error_response("ssh command not found on the local machine", code="ssh_runtime_error")
-    except subprocess.TimeoutExpired:
-        return error_response("ssh command timed out", code="ssh_timeout")
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                try:
+                    invocation = ssm.get_command_invocation(CommandId=command_id, InstanceId=INSTANCE_ID)
+                except Exception:
+                    time.sleep(poll_interval)
+                    continue
 
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-    if result.returncode != 0:
-        return error_response(
-            "ssh command failed",
-            code="ssh_command_failed",
-            details={"returncode": result.returncode, "stdout": stdout, "stderr": stderr, "command": command},
-        )
-    return {"ok": True, "stdout": stdout, "stderr": stderr, "returncode": result.returncode, "command": command}
+                status = invocation.get("Status", "Unknown")
+                print(f"[ssm] command_id={command_id} status={status}")
+                if status in {"Success", "Cancelled", "Failed", "TimedOut", "Undeliverable", "Terminated"}:
+                    return {
+                        "status": "success" if status == "Success" else "failed",
+                        "stdout": (invocation.get("StandardOutputContent") or "").strip(),
+                        "stderr": (invocation.get("StandardErrorContent") or "").strip(),
+                        "command_id": command_id,
+                    }
+                time.sleep(poll_interval)
+
+            if attempt == max_retries:
+                return {
+                    "status": "failed",
+                    "stdout": "",
+                    "stderr": f"ssm command timed out after {timeout_seconds}s",
+                    "command_id": command_id,
+                }
+        except Exception as exc:
+            if attempt == max_retries:
+                return {"status": "failed", "stdout": "", "stderr": str(exc)}
+            time.sleep(0.5)
+
+    return {"status": "failed", "stdout": "", "stderr": "ssm command failed"}
 
 
 def set_fault_state(service_name: str, **updates: Any) -> dict[str, Any]:

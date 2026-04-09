@@ -1,4 +1,4 @@
-"""Chaos controls using SSH for kill/restart and local state for simulated faults."""
+"""Chaos controls using SSM for kill/restart and local state for simulated faults."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ from core.services import (
     observe_latency,
     reset_latency_spike,
     reset_memory_leak,
-    run_ssh,
+    run_ssm_command,
     service_exists,
-    SERVICE_ORDER,
+    SERVICE_PORTS,
     service_port,
     service_status,
     service_replica_count,
@@ -93,25 +93,21 @@ def inject_latency(service_name: str, latency_spike_ms: int, duration_seconds: i
 
 
 def kill_service(service_name: str, triggered_by: str | None = None) -> dict:
-    """SSH into EC2 and stop the service process."""
+    """Run an SSM command to stop the service process by port."""
 
     if not service_exists(service_name):
         return error_response(f"invalid service name: {service_name}", service_name=service_name, code="invalid_service")
 
     port = service_port(service_name)
     before = _snapshot(service_name)
-    command = (
-        f"PIDS=$(pgrep -f '[u]vicorn service:app --host 0.0.0.0 --port {port}' || true); "
-        f"if [ -n \"$PIDS\" ]; then kill $PIDS || true; fi; "
-        f"exit 0"
-    )
-    ssh_result = run_ssh(command)
-    if "error" in ssh_result:
-        return ssh_result
-
-    transition = _wait_for_reachability(service_name, expected_reachable=False, attempts=12, interval_seconds=0.75)
-    if "error" in transition:
-        return transition
+    result = run_ssm_command([f"fuser -k {port}/tcp || true"])
+    if result.get("status") != "success":
+        return {
+            "service": service_name,
+            "status": "failed",
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+        }
 
     mark_killed(service_name, True, triggered_by=triggered_by)
     set_fault_state(service_name, degraded=False, triggered_by=triggered_by)
@@ -124,37 +120,48 @@ def kill_service(service_name: str, triggered_by: str | None = None) -> dict:
 
     after = _snapshot(service_name)
     append_event("kill_service", service_name, before, after, triggered_by)
-    return {
-        "ok": True,
-        "service": service_name,
-        "status": "down",
-        "ssh": ssh_result,
-        "transition": transition,
-        "cascaded_dependents": dependents,
-    }
+    return {"service": service_name, "action": "killed", "command_id": result.get("command_id")}
 
 
 def restart_service(service_name: str, triggered_by: str | None = None) -> dict:
-    """Restart a service via SSH and recover its dependents."""
+    """Restart a service via SSM and recover its dependents."""
 
     if not service_exists(service_name):
         return error_response(f"invalid service name: {service_name}", service_name=service_name, code="invalid_service")
 
-    port = service_port(service_name)
+    port = SERVICE_PORTS[service_name]
     before = _snapshot(service_name)
-    service_index = SERVICE_ORDER.index(service_name) + 1
+    log_file = f"log{port}.txt"
+    commands = [
+        (
+            "bash -lc '"
+            "export HOME=/home/ubuntu; "
+            "export PYTHONUSERBASE=/home/ubuntu/.local; "
+            "export PATH=/home/ubuntu/.local/bin:$PATH; "
+            "cd ~/claudedevops; "
+            f"fuser -k {port}/tcp || true; "
+            "sleep 0.5; "
+            "python3 -m pip show fastapi >/dev/null 2>&1 || python3 -m pip install --user fastapi uvicorn >/dev/null 2>&1; "
+            f"(nohup python3 -m uvicorn service:app --host 0.0.0.0 --port {port} > {log_file} 2>&1 < /dev/null &); "
+            "sleep 0.5; "
+            f"pgrep -f \"[u]vicorn service:app --host 0.0.0.0 --port {port}\" >/dev/null || (nohup /home/ubuntu/.local/bin/uvicorn service:app --host 0.0.0.0 --port {port} > {log_file} 2>&1 < /dev/null &); "
+            "sleep 0.5; "
+            f"pgrep -f \"[u]vicorn service:app --host 0.0.0.0 --port {port}\" >/dev/null || (echo START_FAILED; tail -n 20 {log_file}; exit 1)"
+            "'"
+        )
+    ]
+    result = run_ssm_command(commands)
+    if result.get("status") != "success":
+        return {
+            "service": service_name,
+            "status": "failed",
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+        }
 
-    restart_cmd = (
-        f"cd /home/ubuntu && "
-        f"export PATH=\"/home/ubuntu/.local/bin:$PATH\"; "
-        f"mkdir -p /home/ubuntu/claudedevops; "
-        f"fuser -k {port}/tcp || true; "
-        f"nohup uvicorn service:app --host 0.0.0.0 --port {port} > /home/ubuntu/claudedevops/log{service_index}.txt 2>&1 & "
-        f"exit 0"
-    )
-    restart_result = run_ssh(restart_cmd)
-    if "error" in restart_result:
-        return restart_result
+    transition = _wait_for_reachability(service_name, expected_reachable=True, attempts=3, interval_seconds=1.0)
+    if "error" in transition:
+        return transition
 
     mark_killed(service_name, False, triggered_by=triggered_by)
     reset_latency_spike(service_name)
@@ -173,7 +180,7 @@ def restart_service(service_name: str, triggered_by: str | None = None) -> dict:
             append_event("cascade_recover", dependent_name, dependent_before, _snapshot(dependent_name), service_name)
             recovered.append(dependent_name)
 
-    return {"service": service_name, "action": "restarted", "port": port}
+    return {"status": "restarting", "service": service_name, "port": port}
 
 
 def simulate_memory_leak(service_name: str, triggered_by: str | None = None) -> dict:
